@@ -168,8 +168,136 @@ Thuật toán **Sliding Window Counter** bằng `deque` timestamp trong 60 giây
 
 ## Part 5: Scaling & Reliability
 
-### Exercise 5.1-5.5: Implementation notes
-[Your explanations and test results]
+### Exercise 5.1: Health checks — liveness vs readiness
+
+- **Liveness `/health`**: kiểm tra process còn sống. Trong bản develop, endpoint trả `status`, `uptime_seconds`, `version`, `environment` và kiểm tra RAM qua `psutil`; RAM trên 90% thì `status=degraded`. Trong bản production, endpoint kiểm tra `redis.ping()`, trả HTTP **200** khi process sống (`status` có thể là `degraded` nếu Redis lỗi). Nếu liveness trả lỗi, Docker/Kubernetes có thể restart container.
+- **Readiness `/ready`**: kiểm tra instance đã sẵn sàng nhận traffic hay chưa. Bản develop trả **503** trong lúc startup/shutdown; bản production gọi `redis.ping()` và trả **503 `Redis not available`** nếu Redis không kết nối được. Load balancer chỉ route traffic tới instance readiness trả 200.
+- **Tách hai probe để tránh restart loop**: nếu `/health` phụ thuộc Redis, chỉ cần Redis lỗi cũng làm container bị restart liên tục dù ứng dụng vẫn hoạt động. `/health` đánh giá process; `/ready` đánh giá dependency và khả năng phục vụ traffic.
+
+Kết quả thực tế trên stack 3 instance:
+
+    $ curl -i http://localhost:8080/health
+    HTTP/1.1 200 OK
+    X-Served-By: 172.19.0.3:8000
+    {"status":"ok","instance_id":"instance-ee1e3b","uptime_seconds":68.6,"storage":"redis","redis_connected":true}
+
+    $ curl -i http://localhost:8080/ready
+    HTTP/1.1 200 OK
+    X-Served-By: 172.19.0.4:8000
+    {"ready":true,"instance":"instance-d56414"}
+
+### Exercise 5.2: Graceful shutdown
+
+Bản develop đăng ký `signal.signal(signal.SIGTERM, handle_sigterm)` và `SIGINT`. Khi nhận `SIGTERM`, uvicorn ngừng nhận request mới, middleware đếm `_in_flight_requests`, còn `lifespan` chờ các request đang chạy hoàn thành tối đa **30 giây** trước khi đóng kết nối và thoát (`timeout_graceful_shutdown=30`). Vì vậy request đang xử lý không bị cắt ngang khi deploy, restart hoặc scale-down.
+
+Test thực tế bằng `docker stop` (gửi `SIGTERM`):
+
+    $ docker stop -t 10 k5-day14-scaling-agent-2
+    agent-2  | INFO:     Shutting down
+    agent-2  | INFO:     Waiting for application shutdown.
+    agent-2  | INFO:app:Instance instance-465eab shutting down
+    agent-2  | INFO:     Application shutdown complete.
+    agent-2  | INFO:     Finished server process [1]
+
+### Exercise 5.3: Stateless design
+
+Bản production không lưu conversation trong RAM. `save_session()` dùng `_redis.setex(f"session:{session_id}", 3600, json_data)` để lưu session/history trong Redis với TTL 1 giờ; `load_session()` đọc lại từ Redis, nên mọi agent instance đều thấy cùng trạng thái. `history` được giới hạn 20 message (10 lượt). Chỉ khi Redis không kết nối được mới fallback sang dict trong RAM — trường hợp này **không scale-safe** và được log cảnh báo.
+
+Anti-pattern khi lưu state trong RAM: request của user có thể rơi vào instance A rồi instance B; instance B không có `history` của user. Giải pháp Redis giữ state ở ngoài process, nhờ vậy request có thể phục vụ bởi bất kỳ instance nào và state còn nguyên sau restart.
+
+Bằng chứng state thực sự nằm trong Redis:
+
+    $ docker compose -p k5-day14-scaling exec redis redis-cli --scan --pattern 'session:*'
+    session:1fe1901a-41ea-4e81-9a33-53b4c499e962
+    session:9f276698-266a-431a-96b2-2d684185a0eb
+    session:demo
+
+### Exercise 5.4: Load balancing với 3 instance
+
+    touch 05-scaling-reliability/production/.env.local
+    cd 05-scaling-reliability/production
+    docker compose -p k5-day14-scaling up -d --build --scale agent=3
+    docker compose -p k5-day14-scaling ps
+
+Kết quả:
+
+    NAME                       STATUS                   PORTS
+    k5-day14-scaling-agent-1   Up ... (healthy)         8000/tcp
+    k5-day14-scaling-agent-2   Up ... (healthy)         8000/tcp
+    k5-day14-scaling-agent-3   Up ... (healthy)         8000/tcp
+    k5-day14-scaling-nginx-1   Up ...                   0.0.0.0:8080->80/tcp
+    k5-day14-scaling-redis-1   Up ... (healthy)         6379/tcp
+
+Luồng request: client → **Nginx :8080** → `upstream agent_cluster` → 3 agent `:8000`. Docker DNS (`127.0.0.11`) trả về các IP của service `agent`; Nginx phân tán round-robin. Header `X-Served-By` cho biết instance đã xử lý, còn trường `served_by` trong JSON response là ID logic của instance.
+
+    $ curl -i -X POST http://localhost:8080/chat \
+        -H "Content-Type: application/json" \
+        -d '{"question":"Request 1","session_id":"demo"}'
+    HTTP/1.1 200 OK
+    X-Served-By: 172.19.0.4:8000
+    {"session_id":"demo","question":"Request 1","answer":"Đây là câu trả lời từ AI agent (mock)...","turn":3,"served_by":"instance-d56414","storage":"redis"}
+
+Gửi 10 request cùng session để kiểm tra phân tán tải:
+
+    Request  1 -> HTTP 200, served_by=instance-ee1e3b
+    Request  2 -> HTTP 200, served_by=instance-d56414
+    Request  3 -> HTTP 200, served_by=instance-ee1e3b
+    Request  4 -> HTTP 200, served_by=instance-4a2803
+    Request  5 -> HTTP 200, served_by=instance-d56414
+    Request  6 -> HTTP 200, served_by=instance-ee1e3b
+    Request  7 -> HTTP 200, served_by=instance-4a2803
+    Request  8 -> HTTP 200, served_by=instance-d56414
+    Request  9 -> HTTP 200, served_by=instance-ee1e3b
+    Request 10 -> HTTP 200, served_by=instance-4a2803
+    Instances used: {'instance-ee1e3b', 'instance-4a2803', 'instance-d56414'}
+
+**Failover test:** dừng `agent-2`, request tiếp vẫn trả **HTTP 200** và được instance khác phục vụ (`served_by=instance-ee1e3b`). Nginx tự thử upstream tiếp theo nhờ `proxy_next_upstream error timeout http_503`; history của cùng session vẫn còn đủ **12 message** trong Redis. Như vậy khi một instance ngừng hoạt động, service không bị gián đoạn và không mất state.
+
+### Exercise 5.5: Test stateless
+
+    cd 05-scaling-reliability/production
+    python test_stateless.py
+
+> Trên Windows PowerShell, dùng `New-Item -ItemType File .env.local -Force` thay cho `touch`, và đặt `$env:PYTHONIOENCODING='utf-8'` trước khi chạy script để in được tiếng Việt.
+
+Kết quả thực tế:
+
+    ============================================================
+    Stateless Scaling Demo
+    ============================================================
+
+    Session ID: 9f276698-266a-431a-96b2-2d684185a0eb
+
+    Request 1: [instance-465eab]
+    Request 2: [instance-ee1e3b]
+    Request 3: [instance-d56414]
+    Request 4: [instance-465eab]
+    Request 5: [instance-ee1e3b]
+
+    Total requests: 5
+    Instances used: {'instance-ee1e3b', 'instance-465eab', 'instance-d56414'}
+    ✅ All requests served despite different instances!
+
+    --- Conversation History ---
+    Total messages: 10
+      [user]: What is Docker?...
+      [assistant]: Container là cách đóng gói app để chạy ở mọi nơi...
+      [user]: Why do we need containers?...
+      [assistant]: Agent đang hoạt động tốt! (mock response)...
+      [user]: What is Kubernetes?...
+      [assistant]: Đây là câu trả lời từ AI agent (mock)...
+      [user]: How does load balancing work?...
+      [assistant]: Agent đang hoạt động tốt! (mock response)...
+      [user]: What is Redis used for?...
+      [assistant]: Agent đang hoạt động tốt! (mock response)...
+
+    ✅ Session history preserved across all instances via Redis!
+
+**Kết luận:** 5 request được load balance qua 3 agent khác nhau nhưng vẫn có đủ 10 message (5 câu hỏi + 5 câu trả lời) vì state nằm trong Redis, không nằm trong RAM của từng container. Sau failover, cùng session vẫn có 12 message. Đây là bằng chứng ứng dụng **stateless** và có thể scale ngang an toàn.
+
+Dọn stack sau khi test:
+
+    docker compose -p k5-day14-scaling down
 ```
 
 ---
