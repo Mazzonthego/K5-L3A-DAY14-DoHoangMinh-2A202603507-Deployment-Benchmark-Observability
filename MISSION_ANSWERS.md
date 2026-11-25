@@ -419,14 +419,87 @@ your-repo/
 
 ## Part 6: Final Project — output `check_production_ready.py`
 
-> **Trạng thái:** đã hoàn thiện agent trong `06-lab-complete/` (config từ env, `/health` + `/ready`, API key 401, rate limit 429, cost guard 402, log JSON, SIGTERM, Dockerfile multi-stage, compose + Redis, `railway.toml`).
-> **Việc còn lại:** chạy bản đầy đủ (cần Docker) rồi dán output vào đây:
+**Lệnh đã chạy (WSL2 Ubuntu, Docker 29.9.3):**
 
     cd 06-lab-complete
-    python check_production_ready.py
-    # Kết quả mong đợi: PASS 12/12
+    python check_production_ready.py     # exit code = 0
 
-*(Phần "📋 Checklist Deliverable" của output sẽ được dán vào đây sau khi chạy bản đầy đủ.)*
+**Output thật (rút gọn phần tiêu chí, giữ nguyên kết quả):**
+
+    ✅ 1. Dockerfile (multi-stage, < 500 MB)
+         ✅ Multi-stage build (≥ 2 lệnh FROM)
+         ✅ Base image gọn — stage cuối dùng python:3.11-slim
+         ✅ Chạy bằng user non-root
+         ✅ Có HEALTHCHECK
+         ✅ Docker: build image thành công — 7s
+         ✅ Docker: image < 500 MB — 273 MB
+         ✅ Docker: container chạy được, GET /health → 200
+
+    ✅ 2. docker-compose.yml (agent + redis)
+         ✅ Có service agent (build từ Dockerfile) + redis — services: agent, redis
+         ✅ Service agent kết nối redis (REDIS_URL + depends_on)
+
+    ✅ 3. .dockerignore
+         ✅ Loại trừ .env (secrets), __pycache__, venv
+
+    ✅ 4. Health check endpoint (GET /health)
+         ✅ Khi chạy: GET /health → 200 — uvicorn --workers 2
+
+    ✅ 5. Readiness endpoint (GET /ready)
+         ✅ Khi chạy: GET /ready → 200
+         ✅ Khi chạy: Redis mất kết nối → /ready 503 (còn /health vẫn 200)
+
+    ✅ 6. API Key authentication
+         ✅ Khi chạy: thiếu / sai API key → 401
+         ✅ Khi chạy: API key đúng → 200
+
+    ✅ 7. Rate limiting
+         ✅ Khi chạy: vượt giới hạn → 429 — 429 sau 5 request thành công (RATE_LIMIT_PER_MINUTE=5)
+         ✅ Khi chạy: state nằm trong Redis — restart agent vẫn bị 429
+
+    ✅ 8. Cost guard
+         ✅ Khi chạy: hết budget → 402 — 402 ở request thứ 2
+
+    ✅ 9. Config từ environment variables
+         ✅ app/config.py đọc biến môi trường
+         ✅ .env.example liệt kê đủ biến cấu hình · .env nằm trong .gitignore
+         ✅ Không hard-code secret trong code
+         ✅ Khi chạy: agent dùng AGENT_API_KEY và RATE_LIMIT_PER_MINUTE từ env
+
+    ✅ 10. Structured logging
+         ✅ Code ghi log dạng JSON
+         ✅ Khi chạy: mọi dòng log của app là JSON hợp lệ — 12 dòng JSON
+
+    ✅ 11. Graceful shutdown
+         ✅ Code xử lý SIGTERM / lifespan shutdown
+         ✅ Khi chạy: SIGTERM lúc đang có request → request vẫn 200, process tự thoát — exit code 0
+         ✅ Docker: `docker stop` tắt êm (exit code 0, < 10s) — exit code 0, 1.0s
+
+    ✅ 12. Public URL ready (Railway / Render config)
+         ✅ Có railway.toml (không chỉ toàn comment)
+         ✅ railway.toml: builder + healthcheckPath = "/health"
+         ✅ App lắng nghe theo biến PORT do platform cấp
+
+    ================================================================
+      📋 Checklist Deliverable
+         ✅ Dockerfile (multi-stage, < 500 MB)
+         ✅ docker-compose.yml (agent + redis)
+         ✅ .dockerignore
+         ✅ Health check endpoint (GET /health)
+         ✅ Readiness endpoint (GET /ready)
+         ✅ API Key authentication
+         ✅ Rate limiting
+         ✅ Cost guard
+         ✅ Config từ environment variables
+         ✅ Structured logging
+         ✅ Graceful shutdown
+         ✅ Public URL ready (Railway / Render config)
+    ----------------------------------------------------------------
+      Result: 12/12 tiêu chí đạt · 41/41 checks passed
+      🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+    ================================================================
+
+**Ghi chú môi trường:** lần chạy đầu agent không khởi động được vì `.venv` (WSL) thiếu `redis`; sau khi `pip install redis==5.1.0 psutil==6.0.0` là đạt. Lưu ý `pydantic==2.9.0` trong `requirements.txt` **không có wheel cho Python 3.14** (chỉ build được từ source → fail); trên Python 3.11 của Docker image vẫn cài bình thường, nên không sửa file này.
 
 ---
 
@@ -488,7 +561,7 @@ avg tăng nhẹ (+67%) còn p99 tăng vọt (+625%) → SLO phải đặt theo *
 | CP2 | Build image, đo size, bật Compose stack | Docker Hub trả 429 → lấy `python:3.11-slim` từ mirror ECR; cổng 80 bị chiếm → dùng `8080:80` |
 | CP3 | Test 401 / 200 / 429 + giải thích cost guard | Token JWT đã che trước khi dán |
 | CP4 | Health/readiness, stateless, scale 3 instance, `test_stateless.py` | Dùng `-p k5-day14-scaling` để không trùng project |
-| CP5 | Sửa TODO trong `06-lab-complete/` | Chạy `check_production_ready.py` tới `PASS 12/12` (cần Docker) |
+| CP5 | Sửa TODO trong `06-lab-complete/`, chạy `check_production_ready.py` đầy đủ | ✅ **PASS 12/12 · 41/41 checks** (exit 0). Docker image 273 MB, `docker stop` 1.0s |
 | CP6 | `railway.toml` + `DEPLOYMENT.md` + Part 3 (so sánh Railway/Render, Cloud Run) | Chưa deploy — cần `railway login` bằng tài khoản của bạn |
 | CP7 | Load test 4 mức + 3 mức `MOCK_SLOW_RATE`, eval v1/v2/v2-fixed (23/23), metric `agent_question_length_chars`, CI `eval.yml` | Chạy trong WSL2 với `.venv` Python 3.14 |
 | CP8 | Observability stack + ảnh + nộp | **Còn lại** — cần Docker chạy được |
