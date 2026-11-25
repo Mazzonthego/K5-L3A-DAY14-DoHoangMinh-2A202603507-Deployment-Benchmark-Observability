@@ -5,9 +5,13 @@
 # Stage 1: Builder
 FROM python:3.11-slim AS builder
 
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
 WORKDIR /build
+RUN python -m venv /opt/venv
 COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 
 # Stage 2: Runtime
@@ -17,7 +21,9 @@ RUN groupadd -r agent && useradd -r -g agent -d /app agent
 
 WORKDIR /app
 
-COPY --from=builder /root/.local /home/agent/.local
+# Venv đặt ở /opt/venv (đọc được bởi mọi user) thay vì `pip install --user`
+# → user `agent` không cần quyền ghi vào home, PATH/PYTHONPATH luôn đúng.
+COPY --from=builder /opt/venv /opt/venv
 COPY app/ ./app/
 COPY utils/ ./utils/
 
@@ -25,7 +31,7 @@ RUN chown -R agent:agent /app
 
 USER agent
 
-ENV PATH=/home/agent/.local/bin:$PATH
+ENV PATH=/opt/venv/bin:$PATH
 ENV PYTHONPATH=/app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1

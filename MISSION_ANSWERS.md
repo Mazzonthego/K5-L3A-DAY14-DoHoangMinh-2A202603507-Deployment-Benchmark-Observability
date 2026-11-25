@@ -548,8 +548,51 @@ avg tăng nhẹ (+67%) còn p99 tăng vọt (+625%) → SLO phải đặt theo *
 - **Cost/câu đúng** của v2 thấp hơn v1 ~11× dù tổng cost cao hơn → đánh đổi chất lượng/cost có lợi; đổi lại token/câu gần gấp đôi và p95 latency +30 ms (thêm bước retrieval).
 - **Quality gate chặn merge:** `run_eval.py` trả **exit code 1** khi accuracy < `--min-accuracy` hoặc có regression. Job `.github/workflows/eval.yml` chạy eval mỗi Pull Request với `--min-accuracy 0.85` → exit ≠ 0 ⇒ job fail ⇒ PR không merge được.
 
-### 7.4–7.7 Observability stack (CP8)
-> ⚠️ **Chưa làm — cần Docker:** Grafana/Jaeger/Prometheus/Locust, ảnh trace chậm + trace lỗi + alert firing, và benchmark scale 1 vs 3 instance. Chi tiết bước làm: `STEP.md` mục CP8.
+### 7.4–7.7 Observability stack (CP8) — stack Docker đầy đủ
+
+Báo cáo chi tiết: **[`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md)** mục 4–6 · Ảnh: [`screenshots/`](screenshots/) · CSV: [`benchmark-results/`](benchmark-results/) · Bằng chứng trace/log: [`reports/jaeger/`](reports/jaeger/)
+
+Stack đã bật thật: `docker compose -p k5-day14-observability up -d --build --scale agent=1` → Nginx :8080 → agent ×N → Jaeger :16686 (OTLP) + Prometheus :9090 (scrape) → Grafana :3000, Locust :8089.
+
+**7.4 — Đọc dashboard Grafana (số liệu lúc scale 3, đang tải):**
+- **p95 vs avg:** avg **236,9 ms**, p50 **180,6 ms**, p95 **297,1 ms**, p99 **1.820 s** → p99 gấp ~7,7× avg. Nhìn avg thì tưởng ổn, thực tế có nhóm 3% request chậm bất thường kéo p99 lên ~1,8 s.
+- **req/s theo instance:** 12,49 / 12,33 / 12,47 req/s (tổng 37,3 req/s) → Nginx chia tải gần như **đều tuyệt đối**; header `X-Served-By` trả IP instance đã phục vụ.
+- **input vs output token/s:** input **2.945 token/s**, output **1.580 token/s** (tỉ lệ 1,87) → input lớn hơn vì prompt v2 có context truy xuất từ KB (95 input token/câu so với 37 của v1).
+- **Vì sao `/metrics` 404:** Nginx có `location = /metrics { return 404; }` để **không lộ** metrics ra ngoài; Prometheus scrape **trực tiếp trong mạng nội bộ** (`agent:8000/metrics` qua DNS service discovery) → `curl localhost:8080/metrics → 404` nhưng `GET http://localhost:8000/metrics` trong container agent → **200**.
+
+**7.5 — Tracing (Jaeger):**
+- **Trace chậm** `5c7037095de1df7e78b73db9bee68124`: `POST /ask` **1,7 s** → `agent.run` 1,7 s → `agent.retrieve_context` **21,9 ms** + `chat mock-llm-small` **1.697,6 ms (98,2%)** → bottleneck ở **LLM upstream**, không phải code của mình. Ảnh: `screenshots/jaeger-slow-trace.png`.
+- **Trace lỗi** `c739e067d2c92d08ade9b254b07b4ac8`: `POST /ask` → **503**, span `chat mock-llm-small` có tag `error=true` + event `exception` (`exception.type` = *Upstream LLM error: 503 Service Unavailable (mock)*). Ảnh: `screenshots/jaeger-error-trace.png`.
+- **Từ log sang trace:** mọi dòng log JSON đều có `trace_id` → `docker compose -p k5-day14-observability logs agent | grep llm_error` ra đúng trace_id của request lỗi; dán vào `http://localhost:16686/trace/<trace_id>` là xem được toàn bộ waterfall. (Bằng chứng: `reports/jaeger/trace_summary.json`, `trace_slow.json`, `trace_error.json`, `agent_logs.jsonl`.)
+
+**7.6 — Alerts & chaos (đổi cấu hình qua `.env` trong `production/`):**
+
+| # | Thay đổi | Alert firing | Thời gian đổi → firing | Panel rõ nhất | Số liệu |
+|---|---|---|---|---|---|
+| A | `MOCK_ERROR_RATE=0.2` | `AgentHighErrorRate` | **86 s** (`for: 1m`) | Golden Signals → Error rate | error rate **20,64%** |
+| B | `+ MOCK_SLOW_RATE=0.3` | `AgentHighLatencyP95` | **144 s** (`for: 2m`) | Latency & Traffic → p95/p99 | p95 **1,907 s** |
+| C | `LLM_MODEL=mock-llm-large` | `LLMCostBurnRateHigh` | đã firing sẵn; sau khi đổi: **$4,38/h → $17,59/h**, LLM p95 0,198 → 0,484 s | 🤖 LLM → Cost burn rate | model large đắt **16,7×**, chậm **2,5×** |
+| D | `docker pause` agent-1 | `AgentInstanceDown` | **46 s** (`for: 30s`) | 🧩 Instances → Instances up | `up=0` cho instance bị pause; `unpause` → tự về 1 |
+| E | `AGENT_VERSION=v1` | **không alert nào** (0 alert active) | — | bảng Agent version → v1 | token/câu 92 → **37**; câu hỏi HPA trả lời **sai** nhưng metric hạ tầng vẫn xanh |
+
+Ảnh: `screenshots/prometheus-alert-firing.png` (**3 alert cùng FIRING**), `screenshots/prometheus-alert-instance-down.png`, `screenshots/grafana-chaos.png`, `screenshots/grafana-v1-no-alert.png`.
+
+- **Vì sao `docker pause` chứ không `docker stop`?** Prometheus tìm agent bằng DNS: container bị `stop` **biến mất khỏi DNS** → coi như target không tồn tại (không phải "down") → `up` không bao giờ = 0 → **không alert**; container bị `pause` vẫn còn trong DNS nhưng không trả lời → `up == 0` → alert bắn.
+- **Thí nghiệm E phát hiện bằng cách nào trong production?** Đây là lỗi **chất lượng**, không phải lỗi hạ tầng → cần (1) **eval/quality monitoring**: `eval/run_eval.py` trên golden dataset + CI gate (`.github/workflows/eval.yml`) và chạy định kỳ trên production; (2) **metric chất lượng** export ra Prometheus: `answer_quality_score` (LLM-as-judge/groundedness), `refusal_rate`, `retrieval_hit_ratio`, `tokens_per_request` (ở thí nghiệm E: 92 → 37 và retrieval hit = 0 là tín hiệu cảnh báo được); (3) **canary + phản hồi người dùng** (so sánh điểm chất lượng/CSAT theo phiên bản); (4) **synthetic check** định kỳ hỏi câu có đáp án biết.
+
+**7.7 — Benchmark scaling (Locust headless, 100 user, 2 phút, `--csv`):**
+
+| Số instance | Request | RPS | p50 (ms) | avg (ms) | p95 (ms) | p99 (ms) | Failures | Error rate |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 6.968 | **58,62** | 200 | 271,1 | **620** | 1700 | 72 | 1,03% |
+| 3 | 7.068 | **59,55** | 190 | 246,1 | **280** | 1700 | 83 | 1,17% |
+
+- **Scale có cải thiện p95 không?** Có: p95 **620 → 280 ms (−55%)**, p50 200 → 190, avg 271 → 246 — nhờ chia tải, mỗi instance ít request hơn nên hàng đợi ngắn hơn.
+- **Nút thắt ở đâu?** **Không phải ở server**: `docker stats` cho thấy agent chỉ dùng **7,5% CPU** (giới hạn container 0,5 CPU), RAM ~60/256 MB → còn nhiều headroom. RPS gần như không đổi (58,62 → 59,55, +1,6%) vì **Locust là closed-loop**: 100 user × (response + wait 0,5–2 s) ⇒ throughput tối đa ≈ 64–67 req/s, đúng bằng số đo (64,41 và 65,52). Muốn đo năng lực tối đa phải dùng **open-loop** (rate cố định) hoặc tăng số user.
+- **p99 không đổi (1700 ms cả 2 lần)** vì nó đến từ **slow path của mock LLM** (`MOCK_SLOW_RATE` → ngủ 1,5 s), không phải do xếp hàng → scale giải quyết được queueing nhưng không giải quyết được phụ thuộc upstream.
+- Error rate ~1,1% khớp `MOCK_ERROR_RATE=0.01` ⇒ scale không làm tăng lỗi.
+
+**Sửa lỗi phát sinh:** Dockerfile gốc của `production/` cài package bằng `pip install --user` vào `/home/agent/.local` nhưng user `agent` có home `/app` + `PYTHONPATH=/app` ⇒ `ModuleNotFoundError: No module named 'uvicorn'` (container restart liên tục). Đã đổi sang pattern venv `/opt/venv` giống Dockerfile `06-lab-complete/`. Ngoài ra đã đồng bộ phần `KNOWLEDGE_BASE` đã sửa ở CP7 (entry HPA + JWT) sang `production/utils/mock_llm.py` để agent trong stack cũng trả lời đúng.
 
 ---
 

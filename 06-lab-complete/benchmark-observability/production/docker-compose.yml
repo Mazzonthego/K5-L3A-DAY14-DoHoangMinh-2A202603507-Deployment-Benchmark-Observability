@@ -53,6 +53,7 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - agent
+    restart: unless-stopped
     networks: [obs_net]
 
   # ──────────────────────────────────────
@@ -69,6 +70,7 @@ services:
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    restart: unless-stopped
     networks: [obs_net]
 
   # ──────────────────────────────────────
@@ -89,6 +91,7 @@ services:
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
+    restart: unless-stopped
     networks: [obs_net]
 
   # ──────────────────────────────────────
@@ -99,6 +102,7 @@ services:
     ports:
       - "16686:16686"   # Jaeger UI
       - "4318:4318"     # OTLP/HTTP (cho phép app chạy ngoài Docker gửi trace vào)
+    restart: unless-stopped
     networks: [obs_net]
 
   # ──────────────────────────────────────
@@ -116,6 +120,7 @@ services:
       - ./benchmark-results:/mnt/results
     depends_on:
       - nginx
+    restart: unless-stopped
     networks: [obs_net]
 
 networks:

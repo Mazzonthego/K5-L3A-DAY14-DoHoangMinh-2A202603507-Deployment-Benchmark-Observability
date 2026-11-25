@@ -1,0 +1,52 @@
+{
+  "slow": {
+    "trace_id": "5c7037095de1df7e78b73db9bee68124",
+    "llm_ms": 1697.6,
+    "http_ms": 1728.6,
+    "http_status": 200,
+    "llm_call_log": {
+      "ts": "2026-11-25T15:07:27.733424+00:00",
+      "level": "INFO",
+      "service": "observable-agent",
+      "instance": "ab234c7cd5b2",
+      "event": "llm_call",
+      "trace_id": "5c7037095de1df7e78b73db9bee68124",
+      "span_id": "57dba2d6b67d8aa4",
+      "request_id": "fa5baabf1950",
+      "model": "mock-llm-small",
+      "agent_version": "v2",
+      "input_tokens": 95,
+      "output_tokens": 55,
+      "cost_usd": 4.7e-05,
+      "llm_ms": 1697.6
+    },
+    "http_request_log": {
+      "ts": "2026-11-25T15:07:27.733915+00:00",
+      "level": "INFO",
+      "service": "observable-agent",
+      "instance": "ab234c7cd5b2",
+      "event": "http_request",
+      "trace_id": "5c7037095de1df7e78b73db9bee68124",
+      "span_id": "57dba2d6b67d8aa4",
+      "request_id": "fa5baabf1950",
+      "method": "POST",
+      "route": "/ask",
+      "status": 200,
+      "ms": 1728.6
+    }
+  },
+  "error": {
+    "trace_id": "c739e067d2c92d08ade9b254b07b4ac8",
+    "log": {
+      "ts": "2026-11-25T15:08:04.057890+00:00",
+      "level": "INFO",
+      "service": "observable-agent",
+      "instance": "68d682b289f7",
+      "event": "llm_error",
+      "trace_id": "c739e067d2c92d08ade9b254b07b4ac8",
+      "span_id": "0e26b49b4f97e5ce",
+      "request_id": "f9b62dd3943b",
+      "error": "Upstream LLM error: 503 Service Unavailable (mock)"
+    }
+  }
+}
