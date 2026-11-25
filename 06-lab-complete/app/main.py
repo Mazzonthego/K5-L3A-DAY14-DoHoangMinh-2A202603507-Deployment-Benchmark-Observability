@@ -1,47 +1,115 @@
-"""
-Production AI Agent — Part 6 Final Project (bản khung)
-
-Hoàn thành các TODO để đạt đủ 12 tiêu chí trong README.md, rồi kiểm tra:
-    python check_production_ready.py
-
-Bản khung này chạy được (uvicorn app.main:app) nhưng chưa đạt tiêu chí nào.
-"""
+"""Production-ready FastAPI application for the Day 14 lab."""
+import json
 import logging
+import sys
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from app.auth import verify_api_key
+from app.config import settings
+from app.cost_guard import check_budget, estimate_tokens, record_cost
+from app.rate_limiter import check_rate_limit
+from app.redis_client import close_redis, redis_healthy
 from utils.mock_llm import ask as llm_ask
 
-# TODO (tiêu chí 10 — Structured logging):
-#   Mỗi dòng log của app phải là 1 JSON object hợp lệ, vd
-#   {"ts": "...", "lvl": "INFO", "event": "request", "path": "/ask", "status": 200, "ms": 12.3}
-#   Gợi ý: tự viết logging.Formatter dùng json.dumps.
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Production AI Agent")
+class JsonFormatter(logging.Formatter):
+    """Serialize every application log record as one JSON object."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for field in ("event", "method", "path", "status_code", "duration_ms"):
+            if hasattr(record, field):
+                payload[field] = getattr(record, field)
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+root_logger = logging.getLogger()
+root_logger.handlers.clear()
+root_logger.addHandler(handler)
+root_logger.setLevel(settings.log_level.upper())
+logger = logging.getLogger("app.main")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Close shared resources after uvicorn finishes in-flight requests."""
+    logger.info("agent_started", extra={"event": "startup"})
+    yield
+    close_redis()
+    logger.info("agent_stopped", extra={"event": "shutdown"})
+
+
+app = FastAPI(title="Production AI Agent", lifespan=lifespan)
 
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
+    user_id: str | None = Field(default=None, max_length=200)
 
 
-# TODO (tiêu chí 4): GET /health — liveness: luôn trả 200 khi process còn chạy
-#                    (kể cả khi Redis chưa kết nối được)
-# TODO (tiêu chí 5): GET /ready  — readiness: 200 khi sẵn sàng, 503 khi Redis không kết nối được
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - started) * 1000, 2)
+    logger.info(
+        "request_completed",
+        extra={
+            "event": "request",
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+        },
+    )
+    return response
+
+
+@app.get("/health")
+def health():
+    """Liveness probe: the process is healthy even when Redis is unavailable."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """Readiness probe: accept traffic only when Redis is reachable."""
+    if not redis_healthy():
+        raise HTTPException(status_code=503, detail="Redis is not ready")
+    return {"status": "ready", "redis": "ok"}
 
 
 @app.post("/ask")
-def ask(body: AskRequest):
-    # TODO (tiêu chí 6): bắt buộc header X-API-Key → thêm Depends(verify_api_key)
-    # TODO (tiêu chí 7): check_rate_limit(...) → 429 khi vượt giới hạn
-    # TODO (tiêu chí 8): check_budget() trước khi gọi LLM, record_cost(...) sau khi gọi → 402 khi hết budget
+def ask(body: AskRequest, api_key: str = Depends(verify_api_key)):
+    """Authenticate, enforce shared limits, call the LLM, then record its cost."""
+    check_rate_limit(api_key)
+    check_budget(api_key)
+
     answer = llm_ask(body.question)
-    return {"question": body.question, "answer": answer}
+    input_tokens = estimate_tokens(body.question)
+    output_tokens = estimate_tokens(answer)
+    request_cost = record_cost(input_tokens, output_tokens, api_key)
 
-
-# TODO (tiêu chí 11 — Graceful shutdown):
-#   Khi nhận SIGTERM: ngừng nhận request mới, xử lý xong request đang chạy rồi thoát (exit code 0).
-#   Gợi ý: dùng lifespan của FastAPI để dọn dẹp. Nếu tự đăng ký signal handler cho SIGTERM thì
-#   phải gọi lại handler cũ của uvicorn, nếu không process sẽ không bao giờ tắt.
+    return {
+        "question": body.question,
+        "answer": answer,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": request_cost,
+        },
+    }
