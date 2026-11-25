@@ -417,6 +417,84 @@ your-repo/
 
 ---
 
+## Part 6: Final Project — output `check_production_ready.py`
+
+> **Trạng thái:** đã hoàn thiện agent trong `06-lab-complete/` (config từ env, `/health` + `/ready`, API key 401, rate limit 429, cost guard 402, log JSON, SIGTERM, Dockerfile multi-stage, compose + Redis, `railway.toml`).
+> **Việc còn lại:** chạy bản đầy đủ (cần Docker) rồi dán output vào đây:
+
+    cd 06-lab-complete
+    python check_production_ready.py
+    # Kết quả mong đợi: PASS 12/12
+
+*(Phần "📋 Checklist Deliverable" của output sẽ được dán vào đây sau khi chạy bản đầy đủ.)*
+
+---
+
+## Part 7: Benchmark & Observability — Bước 1 (local)
+
+Báo cáo đầy đủ: **[`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md)** · Dữ liệu gốc: `reports/` (10 file JSON).
+
+### 7.1 Đọc metrics của agent
+- **Counter** (chỉ tăng): `http_requests_total{method="POST",route="/ask",status="200"}`, `llm_tokens_total{model="mock-llm-small",type="input"}`, `llm_cost_usd_total{...}`.
+- **Gauge** (lên xuống): `agent_in_flight_requests` (số request đang xử lý), `agent_info{version="v2",model="mock-llm-small"}`.
+- **Histogram** (chia bucket để tính percentile): `http_request_duration_seconds_bucket{le="0.2",...}`, `llm_request_duration_seconds_bucket`.
+- **Vì sao label `route` dùng `route.path` (template) chứ không dùng URL thật?** Nếu dùng `request.url.path`, bot quét `/wp-admin`, `/.env`, `/a1b2c3`… sẽ tạo hàng nghìn time series → cardinality bùng nổ, Prometheus hết RAM. Dùng template + `unmatched` giữ số series ổn định.
+- **Metric thêm (nhiệm vụ):** `agent_question_length_chars` (Histogram, buckets 20/50/100/200/500/1000/2000) đo phân bố độ dài câu hỏi. Dùng Histogram chứ không label `length=...` vì độ dài có vô số giá trị → cardinality bùng nổ.
+
+### 7.2 Load test & SLO (300 request/mức)
+
+| Concurrency | RPS | p50 (ms) | p95 (ms) | p99 (ms) | Error rate | SLO p95 ≤ 500 ms |
+|---|---|---|---|---|---|---|
+| 1 | 4.36 | 190.2 | 221.1 | 1697.1 | 0.33% | ✅ |
+| 10 | 43.38 | 189.6 | 218.7 | 1696.3 | 0.67% | ✅ |
+| 50 | 109.63 | 202.9 | 280.5 | 1721.0 | 1.33% | ✅ |
+| 100 | 54.87 | 882.3 | 4322.1 | 4801.6 | 1.00% | ❌ (exit code 1) |
+
+RPS không tăng tuyến tính (c=50 → 109,63 req/s rồi c=100 **giảm** còn 54,87 req/s, p95 nhảy lên 4.322 ms): agent `develop/` chạy 1 worker uvicorn, request xếp hàng khi quá tải → cần scale **ngang** (nhiều instance) thay vì tăng concurrency.
+
+Tail latency (`MOCK_SLOW_RATE`, concurrency 20):
+
+| `MOCK_SLOW_RATE` | avg (ms) | p95 (ms) | p99 (ms) |
+|---|---|---|---|
+| 0 | 191.2 | 219.3 | 236.2 |
+| 0.03 (mặc định) | 214.8 | 229.8 | 1658.3 |
+| 0.1 | 318.7 | 1693.9 | 1713.0 |
+
+avg tăng nhẹ (+67%) còn p99 tăng vọt (+625%) → SLO phải đặt theo **percentile (p95/p99)**, không theo trung bình; nếu theo avg, agent vẫn "xanh" trong khi 1 người trong 100 chờ gần 2 giây.
+
+### 7.3 Eval & quality gate (golden dataset 23 câu)
+
+| Chỉ số | Agent v1 | Agent v2 | Agent v2 (sau khi sửa KB) |
+|---|---|---|---|
+| Accuracy | 4.3% (1/23) | 91.3% (21/23) | **100% (23/23)** |
+| Avg tokens / câu | 56.5 | 108.8 | 117.3 |
+| Cost / câu đúng (USD) | 0.00039615 | 0.00003607 | **0.00003573** |
+| Quality gate | ❌ FAIL | ✅ PASS | ✅ PASS (0 regression) |
+
+- **2 câu sai ban đầu của v2:** `scaling-03` (thiếu `cpu`, `memory`, `custom metrics`) và `security-02` (thiếu `token`, `hết hạn`, `chữ ký`) → đã thêm entry HPA + JWT vào `KNOWLEDGE_BASE` trong `develop/utils/mock_llm.py`. Lưu ý: keyword có dấu (`hết hạn`, `chữ ký`) phải viết đúng dấu, nếu không chỉ khớp 1/3 keyword.
+- **Cost/câu đúng** của v2 thấp hơn v1 ~11× dù tổng cost cao hơn → đánh đổi chất lượng/cost có lợi; đổi lại token/câu gần gấp đôi và p95 latency +30 ms (thêm bước retrieval).
+- **Quality gate chặn merge:** `run_eval.py` trả **exit code 1** khi accuracy < `--min-accuracy` hoặc có regression. Job `.github/workflows/eval.yml` chạy eval mỗi Pull Request với `--min-accuracy 0.85` → exit ≠ 0 ⇒ job fail ⇒ PR không merge được.
+
+### 7.4–7.7 Observability stack (CP8)
+> ⚠️ **Chưa làm — cần Docker:** Grafana/Jaeger/Prometheus/Locust, ảnh trace chậm + trace lỗi + alert firing, và benchmark scale 1 vs 3 instance. Chi tiết bước làm: `STEP.md` mục CP8.
+
+---
+
+## AI log / Ghi chú
+
+| Mốc | Việc đã làm | Ghi chú |
+|---|---|---|
+| CP0–CP1 | Setup WSL2 + Docker, chạy develop/production Part 1 | Bản develop nhận `question` qua **query**, production nhận JSON |
+| CP2 | Build image, đo size, bật Compose stack | Docker Hub trả 429 → lấy `python:3.11-slim` từ mirror ECR; cổng 80 bị chiếm → dùng `8080:80` |
+| CP3 | Test 401 / 200 / 429 + giải thích cost guard | Token JWT đã che trước khi dán |
+| CP4 | Health/readiness, stateless, scale 3 instance, `test_stateless.py` | Dùng `-p k5-day14-scaling` để không trùng project |
+| CP5 | Sửa TODO trong `06-lab-complete/` | Chạy `check_production_ready.py` tới `PASS 12/12` (cần Docker) |
+| CP6 | `railway.toml` + `DEPLOYMENT.md` + Part 3 (so sánh Railway/Render, Cloud Run) | Chưa deploy — cần `railway login` bằng tài khoản của bạn |
+| CP7 | Load test 4 mức + 3 mức `MOCK_SLOW_RATE`, eval v1/v2/v2-fixed (23/23), metric `agent_question_length_chars`, CI `eval.yml` | Chạy trong WSL2 với `.venv` Python 3.14 |
+| CP8 | Observability stack + ảnh + nộp | **Còn lại** — cần Docker chạy được |
+
+---
+
 ##  Pre-Submission Checklist
 
 - [ ] Repository is public (or instructor has access)
