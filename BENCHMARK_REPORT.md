@@ -102,7 +102,7 @@ docker compose -p k5-day14-observability up -d --scale agent=3      # scale ngan
 | Ảnh | Nội dung thực tế |
 |---|---|
 | [`screenshots/grafana-dashboard.png`](screenshots/grafana-dashboard.png) | Dashboard khi **scale 3 instance đang có tải**: Traffic **31,3 req/s**, Error rate **1,12%**, p95 **293,66 ms**, In-flight **10**, Instances up **3**, Cost **$2,5027/h**; hàng "Instances": req/s theo từng instance (12,49 / 12,33 / 12,47), Model `mock-llm-small`, Agent version `v2` |
-| [`screenshots/jaeger-slow-trace.png`](screenshots/jaeger-slow-trace.png) | Trace chậm `5c7037095de1df7e78b73db9bee68124`: `POST /ask` **1,7 s** → `agent.run` 1,7 s → `agent.retrieve_context` **21,9 ms** + `chat mock-llm-small` **1,68 s** |
+| [`screenshots/jaeger-slow-trace.png`](screenshots/jaeger-slow-trace.png) | Trace chậm `5c7037095de1df7e78b73db9bee68124`: `POST /ask` **1,7 s** → `agent.run` 1.725,8 ms → `agent.retrieve_context` **26,9 ms** + `chat mock-llm-small` **1.698,6 ms (98,2%)** |
 | [`screenshots/jaeger-error-trace.png`](screenshots/jaeger-error-trace.png) | Trace lỗi `c739e067d2c92d08ade9b254b07b4ac8`: `POST /ask` → **503**, span `chat mock-llm-small` có tag `error=true` + event `exception` (`exception.type`, `exception.message`) |
 | [`screenshots/prometheus-alert-firing.png`](screenshots/prometheus-alert-firing.png) | Trang **Alerts** của Prometheus: **3 alert đang FIRING** — `AgentHighErrorRate`, `AgentHighLatencyP95`, `LLMCostBurnRateHigh` (`AgentInstanceDown` = INACTIVE) |
 
@@ -134,8 +134,16 @@ docker compose -p k5-day14-observability up -d --scale agent=3      # scale ngan
 **Trace chậm** (`screenshots/jaeger-slow-trace.png`):
 
 - `trace_id`: `5c7037095de1df7e78b73db9bee68124`
-- Tổng thời gian: **1728,6 ms** (log `http_request`, status 200) — waterfall trong Jaeger hiển thị 1,7 s
-- Span chiếm nhiều thời gian nhất: **`chat mock-llm-small` = 1.697,6 ms (98,2%)**, còn `agent.retrieve_context` chỉ 21,9 ms (1,3%)
+- Tổng thời gian: **1.729,3 ms** (span `POST /ask` trong Jaeger; log `http_request` ghi `ms = 1728.6`, status 200) — waterfall hiển thị 1,7 s
+- Phân rã span (tính từ `reports/jaeger/trace_slow.json`):
+
+  | Span | Thời gian | Tỉ lệ |
+  |---|---|---|
+  | `POST /ask` | 1.729,3 ms | 100% |
+  | `agent.run` | 1.725,8 ms | 99,8% |
+  | **`chat mock-llm-small`** | **1.698,6 ms** | **98,2%** |
+  | `agent.retrieve_context` | 26,9 ms | 1,6% |
+
   → **Bottleneck nằm ở lời gọi LLM, không phải code của mình** (đúng như `MOCK_SLOW_RATE` mô phỏng "slow upstream")
 - Dòng log tương ứng (grep theo `trace_id`):
 
@@ -147,8 +155,9 @@ docker compose -p k5-day14-observability up -d --scale agent=3      # scale ngan
 **Trace lỗi** (`screenshots/jaeger-error-trace.png`):
 
 - `trace_id`: `c739e067d2c92d08ade9b254b07b4ac8`
-- Tổng thời gian: **107 ms** (`POST /ask` → HTTP **503**)
-- Span lỗi: `chat mock-llm-small` (53,1 ms) có tag `error=true`, event `exception` (`exception.type` = `Upstream LLM error: 503 Service Unavailable (mock)`)
+- Tổng thời gian: **100,7 ms** (span `POST /ask`, `otel.status_code = ERROR`; log `http_request` ghi `ms = 100.1`, status **503**)
+- Span lỗi: **`chat mock-llm-small` = 83,0 ms (82,5%)** với tag `error = true`, `otel.status_code = ERROR`, `error.type = upstream_unavailable`; event `exception` gồm `exception.type = utils.mock_llm.LLMError` và `exception.message = Upstream LLM error: 503 Service Unavailable (mock)` + stack trace trỏ đúng `/app/utils/mock_llm.py:199`
+- Span `agent.retrieve_context` chỉ 15,2 ms → lỗi xuất phát từ **upstream LLM**, không phải từ retrieval
 - Log tương ứng:
 
 ```json
@@ -167,6 +176,21 @@ docker compose -p k5-day14-observability up -d --scale agent=3      # scale ngan
 | **req/s theo instance** | 12,49 / 12,33 / 12,47 req/s cho 3 instance (tổng 37,3 req/s) → Nginx chia tải gần như **đều tuyệt đối** (lệch < 1,5%). Header `X-Served-By` trả về IP instance đã phục vụ, ví dụ `172.20.0.2:8000`. |
 | **input vs output token/s** | input **2.945 token/s**, output **1.580 token/s** (tỉ lệ ~1,87). Input lớn hơn vì prompt của v2 có thêm **context truy xuất từ KB** (95 input token/câu so với 37 của v1). Tổng token/s ≈ 4.525 → ở 37,3 req/s là ~121 token/request. |
 | **Vì sao `/metrics` trả 404?** | Nginx có `location = /metrics { return 404; }` → endpoint metrics **không public ra ngoài** vì lộ thông tin hệ thống (route, lưu lượng, số instance). Prometheus scrape **trực tiếp trong mạng nội bộ** (`agent:8000/metrics` qua DNS service discovery) nên vẫn lấy được: kiểm chứng `curl localhost:8080/metrics → 404` còn `GET http://localhost:8000/metrics` trong container agent → **200**. |
+
+### 4.5 Dữ liệu CSV gốc của các lần chạy chaos
+
+Lưu ý: mỗi lần chạy Locust chaos **kéo dài qua lúc đổi cấu hình**, nên CSV chứa cả giai đoạn trước/sau thay đổi — số liệu chuẩn để kết luận là **ảnh chụp Prometheus theo thời điểm** ở bảng mục 4.2. CSV ở đây để đối chiếu/tái lập.
+
+| File | Kịch bản | `/ask` requests | Failures | p50 | avg | p95 | p99 | max |
+|---|---|---|---|---|---|---|---|---|
+| `benchmark-results/scale_1_stats.csv` | scale 1, cấu hình mặc định | 6.968 | 72 (1,03%) | 200 ms | 271,1 ms | 620 ms | 1.700 ms | 2.464,8 ms |
+| `benchmark-results/scale_3_stats.csv` | scale 3, cấu hình mặc định | 7.068 | 83 (1,17%) | 190 ms | 246,1 ms | 280 ms | 1.700 ms | 2.162,7 ms |
+| `benchmark-results/chaos_run_stats.csv` | A+B: error 20% + slow 30% | 21.167 | 2.063 (9,75%) | 190 ms | 314,9 ms | 1.700 ms | 1.700 ms | 3.183,7 ms |
+| `benchmark-results/chaosD_run_stats.csv` | D: `docker pause` 1/3 instance | 16.679 | 815 (4,89%) | 180 ms | 241,0 ms | 1.700 ms | **10.000 ms** | **10.004,2 ms** |
+| `benchmark-results/cpu_1_stats.csv` | đo CPU khi scale 1 | 3.309 | 27 | 190 ms | 245,6 ms | 1.700 ms | 1.700 ms | 1.730,1 ms |
+| `benchmark-results/cpu_3_stats.csv` | đo CPU khi scale 3 | 3.302 | 25 | 190 ms | 226,9 ms | 1.700 ms | 1.700 ms | 1.733,2 ms |
+
+**Điểm đáng chú ý của kịch bản D:** pause 1 trong 3 instance khiến **p99 của `/ask` nhảy lên 10 s** và `/health` có request treo tới **53,9 s** (Nginx vẫn định tuyến tới instance bị pause cho tới khi hết timeout) → đây chính là loại sự cố "một replica chết" mà `AgentInstanceDown` bắt được, và cho thấy **Nginx cần retry/timeout ngắn hơn** nếu muốn che giấu sự cố một replica.
 
 ---
 
@@ -210,7 +234,7 @@ Số liệu lấy từ `benchmark-results/scale_1_stats.csv` và `scale_3_stats.
 **3 điều học được về benchmark & observability:**
 
 1. **SLO phải đặt theo percentile, không theo average.** avg 236,9 ms nhìn có vẻ đẹp, nhưng p99 là 1.820 s (7,7× avg) và p95 ở mức `MOCK_SLOW_RATE=0.1` là 1.694 s — người dùng tệ nhất chờ gần 2 giây trong khi đồng thời "trung bình" vẫn xanh. Tương tự, alert error rate dùng `for: 1m`/`for: 2m` để lọc spike ngắn, và chính thời gian đó (86 s cho error alert, 144 s cho latency alert) là độ trễ có chủ đích của hệ thống cảnh báo.
-2. **Tracing trả lời được câu hỏi "chậm ở đâu" mà metric không trả lời được.** Metric cho biết p95 = 1,7 s; trace cho biết **span `chat mock-llm-small` chiếm 98,2%** trong khi `agent.retrieve_context` chỉ 21,9 ms → biết ngay đừng tối ưu code, hãy xử lý upstream. Kết hợp với log JSON có `trace_id` là điều kiện tối thiểu để điều tra sự cố từ "người dùng báo chậm" đến tận dòng log cụ thể.
+2. **Tracing trả lời được câu hỏi "chậm ở đâu" mà metric không trả lời được.** Metric cho biết p95 = 1,7 s; trace cho biết **span `chat mock-llm-small` chiếm 98,2%** trong khi `agent.retrieve_context` chỉ 26,9 ms → biết ngay đừng tối ưu code, hãy xử lý upstream. Kết hợp với log JSON có `trace_id` là điều kiện tối thiểu để điều tra sự cố từ "người dùng báo chậm" đến tận dòng log cụ thể.
 3. **Benchmark phải biết mình đang đo gì, và observability hạ tầng không phát hiện được lỗi chất lượng.** Scale 3 instance không làm tăng RPS vì tải bị giới hạn bởi mô hình user closed-loop của Locust (không phải bởi server) — nếu không kiểm tra CPU ta sẽ kết luận sai là "scale không ăn". Ngược lại, thí nghiệm E (`AGENT_VERSION=v1`) cho thấy câu trả lời sai hoàn toàn mà **mọi metric hạ tầng vẫn xanh** → cần thêm lớp eval/quality monitoring, không thể chỉ dựa vào dashboard.
 
 **Nếu đưa agent này lên production thật, sẽ thêm metric / alert nào nữa?**
