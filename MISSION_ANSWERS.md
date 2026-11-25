@@ -83,9 +83,40 @@ Kết quả test qua Nginx:
 
 ## Part 3: Cloud Deployment
 
-### Exercise 3.1: Railway deployment
-- URL: https://your-app.railway.app
-- Screenshot: [Link to screenshot in repo]
+### Exercise 3.1: Railway deployment (nền tảng chính)
+- **Platform:** Railway · **Source deploy:** agent Part 6 trong `06-lab-complete/` (config: `06-lab-complete/railway.toml`, builder `DOCKERFILE`, healthcheck `/health`).
+- **URL:** `https://<your-app>.railway.app` ← điền sau khi chạy `railway domain`.
+- **Các bước:** `railway login --browserless` → `cd 06-lab-complete && railway init` → `railway variables set AGENT_API_KEY=… REDIS_URL=… RATE_LIMIT_PER_MINUTE=10 DAILY_BUDGET_USD=10 ENVIRONMENT=production` → `railway up` → `railway domain`.
+- **Redis:** tạo Redis (plugin) trong project Railway, lấy URL dạng `redis://default:pass@host:port` rồi đặt vào `REDIS_URL`; phải đảm bảo `/ready` trả 200 trước khi chụp ảnh.
+- **Screenshot:** [dashboard](screenshots/dashboard.png) · [running](screenshots/running.png) · [test](screenshots/test.png).
+
+Tự kiểm tra (4 lệnh, mỗi lệnh chỉ in mã HTTP → không lộ key):
+
+    BASE=https://<your-app>.railway.app
+    AGENT_API_KEY=<key-đã-đặt>
+    curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/health"     # 200
+    curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/ready"      # 200
+    curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" \
+      -H 'Content-Type: application/json' -d '{"question":"Hello"}'   # 401
+    curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" \
+      -H 'Content-Type: application/json' -H "X-API-Key: $AGENT_API_KEY" \
+      -d '{"question":"Hello"}'                                        # 200
+
+### So sánh `railway.toml` với `render.yaml`
+| Tiêu chí | Railway (`railway.toml`) | Render (`render.yaml`) |
+|---|---|---|
+| Định dạng | TOML, phẳng: `[build]`, `[deploy]` | YAML, danh sách `services:` |
+| Cách build | `builder = "DOCKERFILE"` (file mình dùng) hoặc `NIXPACKS` tự detect | `runtime: python` + `buildCommand`, hoặc `runtime: docker` |
+| Lệnh start | `startCommand` ngay trong `[deploy]` | `startCommand` thuộc từng service |
+| Health check | `healthcheckPath = "/health"` | `healthCheckPath: /health` |
+| Secret | Đặt riêng qua CLI/Dashboard (`railway variables set`) | `sync: false` (tự nhập) hoặc `generateValue: true` (Render tự sinh) |
+| Redis | Plugin Database → copy `REDIS_URL` | Khai báo thêm service `type: redis` trong blueprint |
+| Deploy | CLI (`railway up`) hoặc GitHub integration | Dashboard → New → Blueprint → connect repo, `autoDeploy` khi push |
+
+→ Railway đơn giản hơn cho CLI-first (1 file, deploy bằng lệnh); Render mạnh hơn ở IaC khai báo sẵn nhiều service (web + Redis) và tự sinh secret, nhưng phải thao tác qua web UI.
+
+### Exercise 3.3: GCP Cloud Run — đọc `cloudbuild.yaml` + `service.yaml` (không cần deploy)
+Pipeline CI/CD trong `cloudbuild.yaml` (trigger khi push `main`): **test** (`pytest`, fail thì dừng) → **build** image Docker tag theo `$COMMIT_SHA` + `latest` và dùng layer cache → **push** lên Container Registry (`gcr.io/$PROJECT_ID/ai-agent`) → **deploy** Cloud Run `gcloud run deploy` với `--image` theo commit, `--allow-unauthenticated`, `--min-instances=1 --max-instances=10`, secret lấy từ Secret Manager. File `service.yaml` mô tả service (Knative): scale `minScale=1`/`maxScale=10`, `containerConcurrency=80`, `timeoutSeconds=60`, env `ENVIRONMENT/PORT`, secret `OPENAI_API_KEY` + `AGENT_API_KEY` từ Secret Manager, liveness probe `/health` và startup probe `/ready`.
 
 ## Part 4: API Security
 

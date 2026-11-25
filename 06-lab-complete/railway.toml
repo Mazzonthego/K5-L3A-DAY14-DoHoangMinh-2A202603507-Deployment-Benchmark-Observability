@@ -1,8 +1,39 @@
 # ============================================================
-# TODO (tiêu chí 12): cấu hình deploy Railway
-#   [build]  builder = "DOCKERFILE"
-#   [deploy] healthcheckPath = "/health"
-#   App phải lắng nghe theo biến PORT do Railway cấp (xử lý trong CMD của Dockerfile).
+# railway.toml — Deploy agent Part 6 (thư mục 06-lab-complete) lên Railway
+# Docs: https://docs.railway.com/reference/config-as-code
 #
-# Chỉ cần một trong hai file railway.toml / render.yaml, nhưng file nào có nội dung thì phải đúng.
+# Deploy:  cd 06-lab-complete && railway up
+# URL:     railway domain
+#
+# Chỉ cần một trong hai file railway.toml / render.yaml.
+# Lớp K5 chọn Railway làm nền tảng chính.
+# ============================================================
+
+[build]
+# Dùng Dockerfile production (multi-stage) ngay trong thư mục này
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Railway tự inject PORT → app phải nghe theo biến này
+startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+
+# Health check: Railway restart service nếu endpoint này fail
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+# Tự restart khi crash
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+numReplicas = 1
+
+# ============================================================
+# Environment variables — đặt qua Dashboard hoặc CLI, KHÔNG ghi vào file:
+#   railway variables set PORT=8000
+#   railway variables set ENVIRONMENT=production
+#   railway variables set AGENT_API_KEY=<key-tự-tạo>
+#   railway variables set REDIS_URL=redis://<host>:<port>
+#   railway variables set RATE_LIMIT_PER_MINUTE=10
+#   railway variables set DAILY_BUDGET_USD=10
 # ============================================================
