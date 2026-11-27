@@ -1,0 +1,14 @@
+# Keep ignore files in LF (Unix) line endings on every OS.
+#
+# Railway (buildkit) reads .gitignore / .dockerignore and forwards the
+# patterns in the "exclude-patterns" header. That header only accepts
+# printable ASCII, so a CRLF file (the \r control char) or a non-ASCII
+# character (e.g. the Unicode box-drawing char U+2500) makes the build
+# fail with:
+#   header key "exclude-patterns" contains value with non-printable ASCII characters
+#
+# These rules force LF on checkout, even on Windows with core.autocrlf=true.
+
+.gitattributes        text eol=lf
+.gitignore            text eol=lf
+.dockerignore        text eol=lf

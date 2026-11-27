@@ -113,35 +113,75 @@ docker compose -p k5-day14-docker down
 
 | Hạng mục | Nội dung |
 |---|---|
-| Platform | Railway |
+| Platform | Railway (deploy từ Dockerfile, `builder = "DOCKERFILE"`) |
 | Source deploy | Agent Part 6 trong `06-lab-complete/` (config: `06-lab-complete/railway.toml`, builder `DOCKERFILE`, healthcheck `/health`) |
-| URL | `https://<your-app>.railway.app` ← **điền sau khi chạy `railway domain`** |
-| Redis | Tạo Redis (plugin) trong project Railway, lấy URL dạng `redis://default:pass@host:port` rồi đặt vào `REDIS_URL`; phải đảm bảo `/ready` trả 200 trước khi chụp ảnh |
+| **URL thật** | **`https://agent-production-6f62b355.up.railway.app`** (domain `ACTIVE`, tạo bằng `railway domain`) |
+| Workspace | `DoHoangMinhh's Projects` (id `a899c199-b413-42f7-b850-ab4e407aa43a`) |
+| Project | `k5-day14-agent` (id `f2b55e96-3367-4d40-abac-0ff3bbea8e3a`) |
+| Environment | `production` (id `dbe86aab-9d22-4e40-8f23-91f4c7826746`) |
+| Service (app) | `agent` (id `aba15d8d-5e9f-4c32-986d-da7924b265f7`) — trạng thái **SUCCESS**, 1/1 replica running |
+| Service (Redis) | `Redis` — plugin `redis:8.2` (id `a6336084-5326-4814-bf52-31a47c2ca337`), volume `redis-volume` mount `/data` (32,7/500 MB) |
+| Deployment | `4dc13a95-1f2c-446d-b6f5-c71a53213728` — **SUCCESS** (25/11/2026 17:50 UTC) |
+| Server / edge | `server: railway-hikari`, `x-railway-edge: sin1` (Singapore) |
+| `PORT` | Do Railway tự inject → app nghe `http://0.0.0.0:8080` (log runtime) |
+| Redis | Plugin `redis:8.2` → lấy `REDIS_URL` dạng `redis://default:…@redis.railway.internal:6379` rồi đặt vào biến `REDIS_URL` của service `agent`; `/ready` phải trả **200** (`"redis":"ok"`) trước khi chụp ảnh |
+| Chi phí | Billing period 25–27/11/2026: **$0.0970** (CPU 0,0094 · Memory 0,0872 · Egress 0,0001 · Volume 0,0003) |
 | Screenshot | [dashboard](screenshots/dashboard.png) · [running](screenshots/running.png) · [test](screenshots/test.png) |
 
-Các bước deploy:
+Các bước deploy (đã chạy thật trong WSL2 Ubuntu, Railway CLI 5.75.0):
 
 ```bash
-railway login --browserless
-cd 06-lab-complete && railway init
-railway variables set AGENT_API_KEY=… REDIS_URL=… RATE_LIMIT_PER_MINUTE=10 DAILY_BUDGET_USD=10 ENVIRONMENT=production
-railway up
-railway domain
+export PATH="$HOME/.npm-global/bin:$PATH"
+
+# 1) Đăng nhập (mở trình duyệt → Approve; --browserless in ra link + mã ghép nối)
+railway login
+#    hoặc: railway login --browserless
+
+# 2) Tạo project + Redis plugin + service app
+cd 06-lab-complete
+railway init --name k5-day14-agent
+railway add --database redis          # tự sinh REDIS_URL cho service Redis
+railway add --service agent
+
+# 3) Đặt biến môi trường (mỗi lệnh MỘT đối số "KEY=VALUE", secret không vào repo)
+railway variable set AGENT_API_KEY=<key>                      --service agent --skip-deploys
+railway variable set REDIS_URL=redis://default:…@redis.railway.internal:6379 --service agent --skip-deploys
+railway variable set ENVIRONMENT=production                   --service agent --skip-deploys
+railway variable set RATE_LIMIT_PER_MINUTE=10                 --service agent --skip-deploys
+railway variable set DAILY_BUDGET_USD=10                      --service agent --skip-deploys
+railway variable set MONTHLY_BUDGET_USD=100                   --service agent --skip-deploys
+railway variable set LOG_LEVEL=INFO                           --service agent --skip-deploys
+
+# 4) Deploy + lấy URL public
+railway up --service agent --detach -y
+railway domain --service agent
+#   -> https://agent-production-6f62b355.up.railway.app
+
+# 5) Kiểm tra lại
+railway service status --service agent
+railway logs --service agent --deployment 4dc13a95-1f2c-446d-b6f5-c71a53213728
 ```
 
-Tự kiểm tra (4 lệnh, mỗi lệnh chỉ in mã HTTP → không lộ key):
+> **Hai lỗi đã gặp và cách sửa (xem `DEPLOYMENT.md`):**
+> 1. `railway variable set` phải nhận **một** đối số `"KEY=VALUE"`; truyền hai đối số sẽ khiến CLI **nối thêm dấu `=`** vào cuối value → `/ask` trả 401 dù có key đúng.
+> 2. Build fail `header key "exclude-patterns" contains value with non-printable ASCII characters` — do `.gitignore`/`.dockerignore` bị **CRLF** và có ký tự khung Unicode (`─`) → chuyển về **LF + ASCII thuần**, thêm `.gitattributes`, và deploy từ **thư mục staging sạch ngoài repo** (`/tmp/k5-deploy`) để CLI không gom pattern exclude từ các file ignore rải rác trong cây repo.
+
+Tự kiểm tra (4 lệnh, mỗi lệnh chỉ in mã HTTP → không lộ key) — **kết quả thật: 200 · 200 · 401 · 200**:
 
 ```bash
-BASE=https://<your-app>.railway.app
+BASE=https://agent-production-6f62b355.up.railway.app
 AGENT_API_KEY=<key-đã-đặt>
-curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/health"     # 200
-curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/ready"      # 200
+curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/health"     # 200  {"status":"ok"}
+curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/ready"      # 200  {"status":"ready","redis":"ok"}
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" \
-  -H 'Content-Type: application/json' -d '{"question":"Hello"}'   # 401
+  -H 'Content-Type: application/json' -d '{"question":"Hello"}'   # 401  {"detail":"Invalid or missing API key"}
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" \
   -H 'Content-Type: application/json' -H "X-API-Key: $AGENT_API_KEY" \
-  -d '{"question":"Hello"}'                                        # 200
+  -d '{"question":"Hello"}'                                        # 200  {"answer":"…","usage":{…}}
 ```
+
+Header xác nhận đang chạy trên Railway: `server: railway-hikari`, `x-railway-edge: sin1`,
+`x-railway-request-id: gKo79Q3OTwicYSVOqmzx2A`.
 
 ### Exercise 3.2: So sánh `railway.toml` với `render.yaml`
 
@@ -843,15 +883,15 @@ your-repo/
 
 | Mục | Trạng thái |
 |---|---|
-| Repository is public (or instructor has access) | ⬜ chưa push repo lên GitHub |
+| Repository is public (or instructor has access) | ✅ repo public: https://github.com/Mazzonthego/K5-L3A-DAY14-DoHoangMinh-2A202603507-Deployment-Benchmark-Observability |
 | `MISSION_ANSWERS.md` completed with all exercises | ✅ |
-| `DEPLOYMENT.md` has working public URL | ⬜ cần deploy thật lên Railway (xem CP6) |
+| `DEPLOYMENT.md` has working public URL | ✅ `https://agent-production-6f62b355.up.railway.app` (deployment `4dc13a95-…` SUCCESS) |
 | All source code in `app/` directory | ✅ `06-lab-complete/app/` |
 | `README.md` has clear setup instructions | ✅ |
 | No `.env` file committed (only `.env.example`) | ✅ `.env` nằm trong `.gitignore`, không có trong history |
-| No hardcoded secrets in code | ✅ |
-| Public URL is accessible and working | ⬜ chờ deploy |
-| Screenshots included in `screenshots/` folder | ✅ 9 ảnh Part 7 |
+| No hardcoded secrets in code | ✅ `AGENT_API_KEY` sinh random, chỉ lưu trên Railway (không ghi vào repo/ảnh) |
+| Public URL is accessible and working | ✅ `/health` → 200, `/ready` → 200 (Redis ok), `/ask` → 401 (thiếu key) / 200 (có key) |
+| Screenshots included in `screenshots/` folder | ✅ 9 ảnh Part 7 + 3 ảnh deploy (`dashboard.png`, `running.png`, `test.png`) |
 | Repository has clear commit history | ✅ |
 | `python check_production_ready.py` → `PASS 12/12` | ✅ exit code 0 |
 | `BENCHMARK_REPORT.md` điền đủ, có `reports/`, `benchmark-results/` và screenshot Part 7 | ✅ |
@@ -861,24 +901,31 @@ your-repo/
 Trước khi nộp, kiểm tra deployment:
 
 ```bash
+# 0. URL public thật + key đã đặt trên Railway
+BASE=https://agent-production-6f62b355.up.railway.app
+AGENT_API_KEY=<key-đã-đặt>
+
 # 1. Health check
-curl https://your-app.railway.app/health
+curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/health"     # 200
 
 # 2. Authentication required
-curl https://your-app.railway.app/ask
-# Should return 401
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" \
+  -H 'Content-Type: application/json' -d '{"question":"Hello"}'
+# -> 401
 
 # 3. With API key works
-curl -H "X-API-Key: YOUR_KEY" https://your-app.railway.app/ask \
-  -X POST -d '{"user_id":"test","question":"Hello"}'
-# Should return 200
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" \
+  -H 'Content-Type: application/json' -H "X-API-Key: $AGENT_API_KEY" \
+  -d '{"question":"Hello"}'
+# -> 200
 
-# 4. Rate limiting
-for i in {1..15}; do 
-  curl -H "X-API-Key: YOUR_KEY" https://your-app.railway.app/ask \
-    -X POST -d '{"user_id":"test","question":"test"}'; 
+# 4. Rate limiting (10 request/phút)
+for i in $(seq 1 15); do
+  curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" \
+    -H 'Content-Type: application/json' -H "X-API-Key: $AGENT_API_KEY" \
+    -d '{"question":"test"}'
 done
-# Should eventually return 429
+# -> 10 lần đầu 200, từ lần 11 trở đi 429
 
 # 5. Part 7 — eval quality gate (agent v2 đang chạy ở local)
 cd 06-lab-complete/benchmark-observability/develop
